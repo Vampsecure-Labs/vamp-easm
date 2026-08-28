@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Base de datos EASM (no versionar — contiene datos de targets)
+vamp_easm.db
+vamp_easm.db-shm
+vamp_easm.db-wal
+
+# Credenciales y secretos
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+
+# Outputs generados
+*.html
+*.pdf
+*.json
+*.sarif
+*.csv
+*.log
+
+# Scope y configuración local
+scope.txt
+nexus_tasks.sh
+
+# Editores y sistema operativo
+.DS_Store
+._*
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+Thumbs.db
