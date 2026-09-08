@@ -81,14 +81,14 @@ BRAND   = "VampSecure Labs — EASM Continuo"
 
 BANNER = (
     "\n"
-    "  ____   ____    _    __  __ ____  _____ ____ _   _ ____  _____   _        _    ____ ____\n"
-    " \\ \\ / / _  |  / \\  |  \\/  |  _ \\/ ____/ ___| | | |  _ \\| ____| | |      / \\  | __ ) ___|\n"
-    "  \\ V / (_| | / _ \\ | |\\/| | |_) \___ \\| |___| | | | |_) |  _|   | |     / _ \\ |  _ \___ \\\n"
-    "   | |  \\__, |/ ___ \\| |  | |  __/ ___) |___  | |_| |  _ <| |___  | |___ / ___ \\| |_) |__) |\n"
-    "   |_|     /_/_/   \_|_|  |_|_|   |____/\\____|\\___/|_| \_|_____| |_____/_/   \_|____/____/\n"
-    '     by Antonio Hernandez "Belky" — VampSecure Studios · vamp-easm v1.1 · External Attack Surface Management\n'
-    "     ─────────────────────────────────────────────────────────────────────────────────────────\n"
-    "     USO EXCLUSIVO EN AUDITORÍAS AUTORIZADAS · El uso no autorizado es ilegal\n"
+    "__   ___   __  __ ___  ___ ___ ___ _   _ ___ ___ _      _   ___ ___ \n"
+    "\\ \\ / /_\\ |  \\/  | _ \\/ __| __/ __| | | | _ \\ __| |    /_\\ | _ ) __|\n"
+    " \\ V / _ \\| |\\/| |  _/\\__ \\ _| (__| |_| |   / _|| |__ / _ \\| _ \\__ \\\n"
+    "  \\_/_/ \\_\\_|  |_|_|  |___/___\\___|\\___/|_|_\\___|____/_/ \\_\\___/___/\n"
+    '  by Antonio Hernandez "Belky" — VampSecure Studios\n'
+    "  vamp-easm v1.1 · External Attack Surface Management\n"
+    "  ────────────────────────────────────────────────────────────────────────\n"
+    "  USO EXCLUSIVO EN AUDITORÍAS AUTORIZADAS · El uso no autorizado es ilegal\n"
 )
 
 # Mapa de colores de severidad para Rich
