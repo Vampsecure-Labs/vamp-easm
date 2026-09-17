@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -75,7 +76,7 @@ from vampsec_report import (
 # Constantes
 # ---------------------------------------------------------------------------
 
-VERSION = "1.1"
+VERSION = "1.2"
 TOOL    = "vamp-easm"
 BRAND   = "VampSecure Labs — EASM Continuo"
 
@@ -86,7 +87,7 @@ BANNER = (
     " \\ V / _ \\| |\\/| |  _/\\__ \\ _| (__| |_| |   / _|| |__ / _ \\| _ \\__ \\\n"
     "  \\_/_/ \\_\\_|  |_|_|  |___/___\\___|\\___/|_|_\\___|____/_/ \\_\\___/___/\n"
     '  by Antonio Hernandez "Belky" — VampSecure Studios\n'
-    "  vamp-easm v1.1 · External Attack Surface Management\n"
+    "  vamp-easm v1.2 · External Attack Surface Management\n"
     "  ────────────────────────────────────────────────────────────────────────\n"
     "  USO EXCLUSIVO EN AUDITORÍAS AUTORIZADAS · El uso no autorizado es ilegal\n"
 )
@@ -455,6 +456,243 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Comando: watch
+# ---------------------------------------------------------------------------
+
+def _escanear_target(
+    target: str,
+    puertos: List[int],
+    usar_nmap: bool,
+    alert_webhook: Optional[str],
+) -> List[differ.Diff]:
+    """
+    Ejecuta un escaneo completo del target, persiste en SQLite y devuelve
+    los diffs calculados frente al escaneo inmediatamente anterior.
+
+    Función interna compartida por cmd_scan (indirectamente) y cmd_watch.
+    """
+    storage.inicializar_db()
+    scan_id = storage.nuevo_scan(target)
+
+    resultado = scanner.ejecutar_escaneo(
+        target=target,
+        puertos=puertos,
+        usar_nmap=usar_nmap,
+    )
+
+    # Persistir subdominios
+    for sub in resultado.subdominios:
+        ip = sub.ips[0] if sub.ips else None
+        storage.upsert_asset(target=target, subdominio=sub.nombre,
+                             scan_id=scan_id, ip=ip)
+
+    # Persistir puertos
+    for pa in resultado.puertos:
+        ip_pa = None
+        for sub in resultado.subdominios:
+            if sub.nombre == pa.host:
+                ip_pa = sub.ips[0] if sub.ips else None
+                break
+        storage.upsert_asset(target=target, subdominio=pa.host,
+                             scan_id=scan_id, ip=ip_pa,
+                             puerto=pa.puerto, protocolo=pa.protocolo,
+                             servicio=pa.servicio)
+
+    # Persistir certificados
+    for cert in resultado.certs:
+        if cert.error:
+            continue
+        storage.insertar_cert(target=target, host=cert.host,
+                              scan_id=scan_id, issued_to=cert.issued_to,
+                              issuer=cert.issuer, not_after=cert.not_after,
+                              sans=",".join(cert.sans) if cert.sans else None,
+                              fingerprint=cert.fingerprint,
+                              autofirmado=cert.autofirmado)
+
+    # Calcular diffs frente al escaneo anterior
+    historial = storage.historial_scans(target, limit=5)
+    scan_id_prev: Optional[str] = None
+    for row in historial:
+        if row["id"] != scan_id:
+            scan_id_prev = row["id"]
+            break
+
+    motor = differ.MotorDiff(target=target, scan_id=scan_id,
+                              scan_id_prev=scan_id_prev, storage=storage)
+    diffs = motor.calcular()
+
+    assets_total = len(resultado.subdominios) + len(resultado.puertos)
+    storage.cerrar_scan(scan_id, assets_found=assets_total,
+                        diffs_found=len(diffs))
+
+    # Gestionar alertas solo si hay cambios
+    if diffs:
+        webhook_url = alerter.resolver_webhook_url(alert_webhook)
+        alerter.gestionar_alertas(webhook_url, target, diffs, scan_id)
+
+    return diffs
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """
+    Modo watch continuo: ejecuta escaneos periódicos del target, compara
+    con el resultado anterior almacenado en SQLite e imprime solo los
+    cambios detectados (nuevos puertos, subdominios, certs, etc.).
+
+    El webhook (--alert-webhook) solo se dispara cuando hay diffs.
+    El bucle continúa hasta interrupción manual (Ctrl+C).
+
+    Returns
+    -------
+    int : Siempre 0 al salir por interrupción.
+    """
+    target   = args.target
+    interval = getattr(args, "interval", 3600)
+    webhook  = getattr(args, "alert_webhook", None)
+
+    # Determinar lista de puertos
+    if getattr(args, "ports", None) and args.ports != "top100":
+        try:
+            puertos = [int(p.strip()) for p in args.ports.split(",") if p.strip()]
+        except ValueError:
+            console.print("[red]Error:[/red] --ports debe ser 'top100' o lista CSV (ej: 22,80,443)")
+            return 1
+    else:
+        puertos = scanner.TOP_100_PORTS
+
+    console.print(Panel(
+        f"[bold cyan]vamp-easm v{VERSION}[/bold cyan]  ·  {BRAND}\n"
+        f"Modo: [bold]WATCH[/bold] · Target: [bold]{target}[/bold] · "
+        f"Intervalo: {interval}s  ·  {_ts_ahora()}",
+        border_style="yellow",
+    ))
+
+    iteracion = 0
+    try:
+        while True:
+            iteracion += 1
+            ts_scan = _ts_ahora()
+            console.print(
+                f"\n[yellow]►[/yellow] [bold]Escaneo #{iteracion}[/bold] — {ts_scan}"
+            )
+
+            diffs = _escanear_target(
+                target=target,
+                puertos=puertos,
+                usar_nmap=getattr(args, "nmap", False),
+                alert_webhook=webhook,
+            )
+
+            if diffs:
+                console.print(_tabla_diffs(diffs))
+            else:
+                console.print(
+                    "[green]✓ Sin cambios respecto al escaneo anterior.[/green]"
+                )
+
+            console.print(
+                f"[dim]Próximo escaneo en {interval}s "
+                f"(Ctrl+C para detener)[/dim]"
+            )
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Watch detenido por el usuario.[/yellow]")
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Comando: diff
+# ---------------------------------------------------------------------------
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    """
+    Muestra todos los cambios detectados entre dos snapshots almacenados.
+
+    --from y --to aceptan fechas en formato YYYY-MM-DD o YYYY-MM-DDTHH:MM.
+    Se busca el escaneo cuyo ts_start sea el más cercano (posterior) a cada
+    fecha indicada.
+
+    Returns
+    -------
+    int : 0 sin diffs, 1 con diffs HIGH, 2 con diffs CRITICAL.
+    """
+    storage.inicializar_db()
+
+    target     = args.target
+    fecha_from = getattr(args, "from_date", None) or ""
+    fecha_to   = getattr(args, "to_date",   None) or ""
+
+    # Obtener historial completo del target (máx 1000 para cubrir rango amplio)
+    historial = storage.historial_scans(target, limit=1000)
+    if not historial:
+        console.print(f"[red]Error:[/red] Sin historial para {target}")
+        return 1
+
+    def _scan_id_por_fecha(fecha_prefix: str, historial_rows) -> Optional[str]:
+        """
+        Devuelve el scan_id cuyo ts_start comienza con fecha_prefix.
+        Si no hay match exacto, devuelve el más antiguo posterior a ese prefijo.
+        """
+        if not fecha_prefix:
+            return None
+        for row in reversed(historial_rows):   # orden cronológico ascendente
+            if row["ts_start"] and row["ts_start"] >= fecha_prefix:
+                return row["id"]
+        return None
+
+    scan_id_from = _scan_id_por_fecha(fecha_from, historial)
+    scan_id_to   = _scan_id_por_fecha(fecha_to,   historial)
+
+    if not scan_id_from:
+        console.print(
+            f"[red]Error:[/red] No se encontró escaneo en o posterior a "
+            f"[bold]{fecha_from}[/bold] para {target}"
+        )
+        return 1
+
+    if not scan_id_to:
+        console.print(
+            f"[red]Error:[/red] No se encontró escaneo en o posterior a "
+            f"[bold]{fecha_to}[/bold] para {target}"
+        )
+        return 1
+
+    if scan_id_from == scan_id_to:
+        console.print("[yellow]⚠ Los dos snapshots apuntan al mismo escaneo — sin diff.[/yellow]")
+        return 0
+
+    console.print(Panel(
+        f"[bold cyan]vamp-easm v{VERSION}[/bold cyan]  ·  {BRAND}\n"
+        f"Target: [bold]{target}[/bold] · Diff acumulado\n"
+        f"Desde: [dim]{fecha_from}[/dim] (scan {scan_id_from[:8]})\n"
+        f"Hasta: [dim]{fecha_to}[/dim]  (scan {scan_id_to[:8]})",
+        border_style="dim",
+    ))
+
+    motor = differ.MotorDiff(
+        target=target,
+        scan_id=scan_id_to,
+        scan_id_prev=scan_id_from,
+        storage=storage,
+    )
+    diffs = motor.calcular()
+
+    if diffs:
+        console.print(_tabla_diffs(diffs))
+    else:
+        console.print("[green]✓ Sin cambios entre los dos snapshots indicados.[/green]")
+
+    sevs = {d.severidad for d in diffs}
+    if "CRITICAL" in sevs:
+        return 2
+    if "HIGH" in sevs:
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI — definición de argumentos
 # ---------------------------------------------------------------------------
 
@@ -469,11 +707,13 @@ def construir_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Ejemplos:\n"
-            "  python vamp_easm.py scan --target ejemplo.com\n"
-            "  python vamp_easm.py scan --target ejemplo.com --ports 22,80,443 --html\n"
+            "  python vamp_easm.py scan    --target ejemplo.com\n"
+            "  python vamp_easm.py scan    --target ejemplo.com --ports 22,80,443 --html\n"
             "  python vamp_easm.py history --target ejemplo.com --limit 5\n"
-            "  python vamp_easm.py assets --target ejemplo.com\n"
-            "  python vamp_easm.py export --target ejemplo.com --json\n"
+            "  python vamp_easm.py assets  --target ejemplo.com\n"
+            "  python vamp_easm.py export  --target ejemplo.com --json\n"
+            "  python vamp_easm.py watch   --target ejemplo.com --interval 1800\n"
+            "  python vamp_easm.py diff    --target ejemplo.com --from 2026-09-01 --to 2026-09-17\n"
         ),
     )
     parser.add_argument(
@@ -482,6 +722,7 @@ def construir_parser() -> argparse.ArgumentParser:
     )
 
     subparsers = parser.add_subparsers(dest="comando", help="Subcomando a ejecutar")
+
 
     # ── scan ─────────────────────────────────────────────────────────────
     p_scan = subparsers.add_parser("scan", help="Escanear un target y calcular diffs")
@@ -527,6 +768,51 @@ def construir_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--html", action="store_true", help="Exportar como HTML")
     add_report_args(p_export)
 
+    # ── watch ─────────────────────────────────────────────────────────────
+    p_watch = subparsers.add_parser(
+        "watch",
+        help="Modo watch continuo: escanea periódicamente y notifica solo cambios",
+    )
+    p_watch.add_argument(
+        "--target", required=True, metavar="DOMINIO",
+        help="Dominio objetivo a monitorizar",
+    )
+    p_watch.add_argument(
+        "--interval", type=int, default=3600, metavar="SEGUNDOS",
+        help="Segundos entre escaneos (default: 3600)",
+    )
+    p_watch.add_argument(
+        "--alert-webhook", metavar="URL", dest="alert_webhook",
+        help="URL del webhook para alertas cuando se detecten cambios "
+             "(alternativa: env EASM_ALERT_WEBHOOK)",
+    )
+    p_watch.add_argument(
+        "--ports", default="top100", metavar="PORTS",
+        help="Puertos a escanear: 'top100' (default) o lista CSV (ej: 22,80,443)",
+    )
+    p_watch.add_argument(
+        "--nmap", action="store_true",
+        help="Usar nmap como backend de escaneo de puertos",
+    )
+
+    # ── diff ──────────────────────────────────────────────────────────────
+    p_diff = subparsers.add_parser(
+        "diff",
+        help="Mostrar cambios acumulados entre dos snapshots almacenados",
+    )
+    p_diff.add_argument(
+        "--target", required=True, metavar="DOMINIO",
+        help="Dominio objetivo",
+    )
+    p_diff.add_argument(
+        "--from", required=True, dest="from_date", metavar="FECHA",
+        help="Fecha de inicio del rango (YYYY-MM-DD o YYYY-MM-DDTHH:MM)",
+    )
+    p_diff.add_argument(
+        "--to", required=True, dest="to_date", metavar="FECHA",
+        help="Fecha de fin del rango (YYYY-MM-DD o YYYY-MM-DDTHH:MM)",
+    )
+
     return parser
 
 
@@ -548,6 +834,8 @@ def main() -> None:
         "history": cmd_history,
         "assets":  cmd_assets,
         "export":  cmd_export,
+        "watch":   cmd_watch,
+        "diff":    cmd_diff,
     }
 
     handler = _dispatch.get(args.comando)
