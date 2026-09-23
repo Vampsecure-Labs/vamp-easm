@@ -76,7 +76,7 @@ from vampsec_report import (
 # Constantes
 # ---------------------------------------------------------------------------
 
-VERSION = "1.2"
+VERSION = "1.3"
 TOOL    = "vamp-easm"
 BRAND   = "VampSecure Labs — EASM Continuo"
 
@@ -87,7 +87,7 @@ BANNER = (
     " \\ V / _ \\| |\\/| |  _/\\__ \\ _| (__| |_| |   / _|| |__ / _ \\| _ \\__ \\\n"
     "  \\_/_/ \\_\\_|  |_|_|  |___/___\\___|\\___/|_|_\\___|____/_/ \\_\\___/___/\n"
     '  by Antonio Hernandez "Belky" — VampSecure Studios\n'
-    "  vamp-easm v1.2 · External Attack Surface Management\n"
+    "  vamp-easm v1.3 · External Attack Surface Management\n"
     "  ────────────────────────────────────────────────────────────────────────\n"
     "  USO EXCLUSIVO EN AUDITORÍAS AUTORIZADAS · El uso no autorizado es ilegal\n"
 )
@@ -197,6 +197,182 @@ def _tabla_historial(rows) -> Table:
 
 
 # ---------------------------------------------------------------------------
+# Integración Shodan  (v1.3)
+# ---------------------------------------------------------------------------
+
+# Puertos considerados sensibles para emitir hallazgo MEDIUM
+_SHODAN_PUERTOS_SENSIBLES = {21, 23, 445, 3389, 1433, 3306, 5432, 5900, 6379, 27017, 9200}
+
+
+class ShodanEASMEnricher:
+    """
+    Enriquecimiento EASM con la API REST de Shodan por IP.
+
+    Para cada IP descubierta en el escaneo consulta
+    https://api.shodan.io/shodan/host/<ip>?key=<api_key>
+    y añade hallazgos al listado de findings del escaneo:
+
+      - Puerto sensible abierto           → MEDIUM
+      - Vulnerabilidades en campo 'vulns' → HIGH
+      - Hostname alternativo              → INFO
+
+    Límite: 10 IPs máximo por invocación (para no agotar créditos API).
+    """
+
+    _HOST_URL = "https://api.shodan.io/shodan/host/{ip}?key={key}"
+    _MAX_IPS   = 10
+
+    def __init__(self, api_key: str) -> None:
+        self._key = api_key
+
+    def _enrich_with_shodan(
+        self,
+        ips_or_hosts: list,
+        api_key: str,
+        findings: list,
+    ) -> None:
+        """
+        Enriquece la lista de findings con datos Shodan para cada IP.
+
+        Modifica findings in-place añadiendo los hallazgos relevantes.
+
+        Parámetros
+        ----------
+        ips_or_hosts : list[str]  — IPs o nombres de host a consultar
+        api_key      : str        — Clave API de Shodan
+        findings     : list       — Lista de Finding a la que se añaden los hallazgos
+        """
+        import urllib.request as _ureq
+        import json as _json
+
+        # Filtrar solo IPs (IPv4 básico) y descartar repeticiones
+        ips_validas = []
+        vistas: set = set()
+        for h in ips_or_hosts:
+            h = h.strip()
+            partes = h.split(".")
+            if len(partes) == 4 and all(p.isdigit() for p in partes) and h not in vistas:
+                ips_validas.append(h)
+                vistas.add(h)
+
+        ips_validas = ips_validas[: self._MAX_IPS]
+
+        idx_base = max((int(f.id.split("-")[-1]) for f in findings if "-" in f.id), default=0)
+
+        for i, ip in enumerate(ips_validas, start=1):
+            url = self._HOST_URL.format(ip=ip, key=api_key)
+            try:
+                req = _ureq.Request(
+                    url,
+                    headers={"User-Agent": f"vamp-easm/{VERSION}"},
+                )
+                with _ureq.urlopen(req, timeout=15) as resp:
+                    codigo = resp.status
+                    if codigo == 401:
+                        findings.append(Finding(
+                            id          = f"EASM-SHD-{idx_base + i:03d}",
+                            title       = "API key Shodan inválida o sin créditos",
+                            severity    = "INFO",
+                            description = "La clave API de Shodan devolvió 401. Verificar validez y cuota.",
+                            evidence    = f"URL: {self._HOST_URL.format(ip=ip, key='***')}",
+                            affected    = ip,
+                            remediation = "Comprobar la clave API en https://account.shodan.io/",
+                            tags        = ["shodan", "easm"],
+                        ))
+                        return   # Si 401, todas las demás peticiones fallarán también
+                    if codigo == 404:
+                        # IP no indexada en Shodan: INFO silencioso
+                        continue
+                    if codigo != 200:
+                        continue
+                    data = _json.loads(resp.read())
+            except Exception:
+                # Error de red o timeout: continuar con la siguiente IP
+                continue
+
+            puertos:   list = data.get("ports", []) or []
+            vulns_raw: dict = data.get("vulns", {}) or {}
+            hostnames: list = data.get("hostnames", []) or []
+            org:       str  = data.get("org", "") or ""
+            sistema:   str  = data.get("os", "") or ""
+
+            # Hallazgo: puertos sensibles abiertos
+            sensibles = [p for p in puertos if p in _SHODAN_PUERTOS_SENSIBLES]
+            for puerto in sensibles:
+                idx_base += 1
+                findings.append(Finding(
+                    id          = f"EASM-SHD-{idx_base:03d}",
+                    title       = f"Puerto sensible {puerto} abierto según Shodan — {ip}",
+                    severity    = "MEDIUM",
+                    description = (
+                        f"Shodan ha indexado el puerto {puerto} como abierto en la IP {ip}. "
+                        "Este puerto corresponde a un servicio de alto riesgo si está expuesto "
+                        "sin control de acceso."
+                    ),
+                    evidence    = (
+                        f"IP: {ip}\n"
+                        f"Puerto: {puerto}\n"
+                        f"Org: {org or '—'}\n"
+                        f"OS: {sistema or '—'}\n"
+                        f"Fuente: Shodan (datos históricos — verificar estado actual)"
+                    ),
+                    affected    = f"{ip}:{puerto}",
+                    remediation = (
+                        f"Verificar si el puerto {puerto} en {ip} debe estar accesible desde Internet. "
+                        "Aplicar reglas de firewall para restringir el acceso por IP de origen. "
+                        "Actualizar el servicio a la última versión segura."
+                    ),
+                    tags        = ["shodan", "easm", "exposed-port"],
+                ))
+
+            # Hallazgo: vulnerabilidades reportadas por Shodan (campo 'vulns')
+            if vulns_raw:
+                cves_str = ", ".join(list(vulns_raw.keys())[:10])
+                idx_base += 1
+                findings.append(Finding(
+                    id          = f"EASM-SHD-{idx_base:03d}",
+                    title       = f"Vulnerabilidades Shodan en {ip}: {cves_str[:60]}",
+                    severity    = "HIGH",
+                    description = (
+                        f"Shodan reporta {len(vulns_raw)} vulnerabilidad(es) conocida(s) en la IP {ip}. "
+                        "Estas vulnerabilidades pueden estar presentes en los servicios actualmente "
+                        "expuestos según el índice de Shodan."
+                    ),
+                    evidence    = (
+                        f"IP: {ip}\n"
+                        f"Vulnerabilidades Shodan: {cves_str}\n"
+                        f"Org: {org or '—'}\n"
+                        f"Fuente: Shodan — los datos pueden tener latencia de semanas"
+                    ),
+                    affected    = ip,
+                    remediation = (
+                        "Verificar el estado actual de las vulnerabilidades listadas en los servicios "
+                        "del host. Consultar el NVD para detalles de parches y aplicarlos. "
+                        "Referencia: https://nvd.nist.gov/"
+                    ),
+                    cve         = list(vulns_raw.keys())[0] if vulns_raw else None,
+                    tags        = ["shodan", "easm", "cve", "vulnerability"],
+                ))
+
+            # Hallazgo INFO: hostname alternativo reportado por Shodan
+            for hostname in hostnames[:3]:
+                idx_base += 1
+                findings.append(Finding(
+                    id          = f"EASM-SHD-{idx_base:03d}",
+                    title       = f"Shodan reporta hostname alternativo: {hostname}",
+                    severity    = "INFO",
+                    description = (
+                        f"Shodan indexa el hostname '{hostname}' para la IP {ip}. "
+                        "Puede indicar servicios adicionales o dominios compartiendo esta IP."
+                    ),
+                    evidence    = f"IP: {ip}\nHostname Shodan: {hostname}",
+                    affected    = ip,
+                    remediation = "Verificar que el hostname corresponde a infraestructura autorizada.",
+                    tags        = ["shodan", "easm", "hostname"],
+                ))
+
+
+# ---------------------------------------------------------------------------
 # Comando: scan
 # ---------------------------------------------------------------------------
 
@@ -291,6 +467,16 @@ def cmd_scan(args: argparse.Namespace) -> int:
     certs_ok = [c for c in resultado.certs if not c.error]
     console.print(f"   {len(certs_ok)} certificados inspeccionados.")
 
+    # ── Nota Shodan al inicio (si no se proporcionó clave) ───────────────────
+    shodan_key_easm = (
+        getattr(args, "shodan_key", None)
+        or __import__("os").environ.get("SHODAN_API_KEY", "")
+    )
+    if not shodan_key_easm:
+        console.print(
+            "[dim]  ℹ Shodan no activo — usa --shodan-key para enriquecer con datos Shodan[/dim]"
+        )
+
     # ── Motor de diffs ────────────────────────────────────────────────────
     console.print("\n[cyan]►[/cyan] [bold]Calculando diffs respecto al escaneo anterior…[/bold]")
     scan_anterior = storage.ultimo_scan(target)
@@ -317,6 +503,24 @@ def cmd_scan(args: argparse.Namespace) -> int:
     # Cerrar escaneo en SQLite
     storage.cerrar_scan(scan_id, assets_found=assets_total, diffs_found=len(diffs))
 
+    # ── Enriquecimiento Shodan (opcional) ────────────────────────────────────
+    findings_shodan: List[Finding] = []
+    if shodan_key_easm:
+        console.print("\n[cyan]►[/cyan] [bold]Enriquecimiento Shodan (por IP)…[/bold]")
+        ips_descubiertas = []
+        for sub in resultado.subdominios:
+            if sub.ips:
+                ips_descubiertas.extend(sub.ips)
+        if ips_descubiertas:
+            enricher = ShodanEASMEnricher(shodan_key_easm)
+            enricher._enrich_with_shodan(ips_descubiertas, shodan_key_easm, findings_shodan)
+            console.print(
+                f"   {len([f for f in findings_shodan if f.severity in ('HIGH','MEDIUM')])} "
+                f"hallazgos Shodan (MEDIUM+HIGH) · {len(findings_shodan)} totales"
+            )
+        else:
+            console.print("   [dim]Sin IPs resueltas para consultar Shodan.[/dim]")
+
     # ── Mostrar resultados ────────────────────────────────────────────────
     if diffs:
         console.print(_tabla_diffs(diffs))
@@ -332,6 +536,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     # ── Exportar informes si se pidió ─────────────────────────────────────
     findings = [d.finding for d in diffs if d.finding is not None]
+    # Incluir hallazgos Shodan en el informe si los hay
+    findings.extend(findings_shodan)
     if findings:
         meta = meta_from_args(args, tool=TOOL, version=VERSION)
         meta.scope = target
@@ -750,6 +956,11 @@ def construir_parser() -> argparse.ArgumentParser:
         "--alert-webhook", metavar="URL", dest="alert_webhook",
         help="URL del webhook para alertas CRITICAL/HIGH (alternativa: env EASM_ALERT_WEBHOOK)",
     )
+    p_scan.add_argument(
+        "--shodan-key", metavar="API_KEY", dest="shodan_key",
+        help="Clave API Shodan (o var SHODAN_API_KEY) — enriquece IPs descubiertas "
+             "con puertos, servicios y vulnerabilidades indexadas por Shodan",
+    )
     add_report_args(p_scan)
 
     # ── history ───────────────────────────────────────────────────────────
@@ -793,6 +1004,11 @@ def construir_parser() -> argparse.ArgumentParser:
     p_watch.add_argument(
         "--nmap", action="store_true",
         help="Usar nmap como backend de escaneo de puertos",
+    )
+    p_watch.add_argument(
+        "--shodan-key", metavar="API_KEY", dest="shodan_key",
+        help="Clave API Shodan (o var SHODAN_API_KEY) — enriquece IPs descubiertas "
+             "con datos Shodan en cada ciclo de watch",
     )
 
     # ── diff ──────────────────────────────────────────────────────────────
