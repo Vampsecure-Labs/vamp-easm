@@ -1,3 +1,4 @@
+<!-- © VampSecure Studios — VampSecure Labs Security Research Division -->
 # vamp-easm
 
 **Continuous External Attack Surface Management with daily diff tracking**
@@ -36,6 +37,13 @@ Part of the [VampSecure Labs](https://github.com/Vampsecure-Labs) security toolk
 ---
 
 ## Installation
+
+
+```bash
+pip install vamp-easm
+# o con Homebrew:
+brew install vampsecure-labs/labs/vamp-easm
+```
 
 ```bash
 # 1. Clone and enter the directory
@@ -188,3 +196,8 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 © VampSecure Studios — VampSecure Labs Security Research Division  
 For authorized penetration testing use only.
+
+---
+
+## Versión
+v1.3 — VampSecure Labs Security Research Division

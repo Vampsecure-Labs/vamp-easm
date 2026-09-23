@@ -76,7 +76,7 @@ from vampsec_report import (
 # Constantes
 # ---------------------------------------------------------------------------
 
-VERSION = "1.3"
+VERSION = "1.4"
 TOOL    = "vamp-easm"
 BRAND   = "VampSecure Labs — EASM Continuo"
 
@@ -87,7 +87,7 @@ BANNER = (
     " \\ V / _ \\| |\\/| |  _/\\__ \\ _| (__| |_| |   / _|| |__ / _ \\| _ \\__ \\\n"
     "  \\_/_/ \\_\\_|  |_|_|  |___/___\\___|\\___/|_|_\\___|____/_/ \\_\\___/___/\n"
     '  by Antonio Hernandez "Belky" — VampSecure Studios\n'
-    "  vamp-easm v1.3 · External Attack Surface Management\n"
+    "  vamp-easm v1.4 · External Attack Surface Management\n"
     "  ────────────────────────────────────────────────────────────────────────\n"
     "  USO EXCLUSIVO EN AUDITORÍAS AUTORIZADAS · El uso no autorizado es ilegal\n"
 )
@@ -373,6 +373,198 @@ class ShodanEASMEnricher:
 
 
 # ---------------------------------------------------------------------------
+# Integración Censys (v1.4)
+# ---------------------------------------------------------------------------
+
+# URL base de la API Censys v2
+_CENSYS_SEARCH_URL = "https://search.censys.io/api/v2/hosts/search"
+
+# Puertos considerados sensibles para enriquecer hallazgos Censys
+_CENSYS_PUERTOS_SENSIBLES = {21, 22, 23, 25, 80, 443, 445, 3389, 1433, 3306, 5432, 5900, 6379, 8080, 8443, 27017, 9200}
+
+
+class CensysEASMEnricher:
+    """
+    Enriquecimiento EASM con la API Censys v2.
+
+    Consulta el endpoint de búsqueda de hosts Censys usando la query
+    ``parsed.names:<dominio>`` para detectar hosts indexados por Censys
+    que no fueron descubiertos por crt.sh/HackerTarget.
+
+    Hallazgos emitidos:
+      - CENSYS_HOST_EXPOSED: host encontrado por Censys pero no en el
+        escaneo activo (superficie no visible para la organización).
+      - Puerto sensible abierto según Censys: MEDIUM.
+
+    Límite: 1 petición por segundo (rate limit de la API gratuita).
+    Resultados por página: 100 hosts (máximo permitido por la API).
+    """
+
+    _MAX_PAGINAS = 3   # máximo de páginas (300 hosts) por invocación
+
+    def __init__(self, censys_id: str, censys_secret: str) -> None:
+        self._id     = censys_id
+        self._secret = censys_secret
+
+    def _auth_header(self) -> str:
+        """Devuelve el valor de la cabecera Authorization (Basic Auth)."""
+        import base64 as _b64
+        creds = f"{self._id}:{self._secret}".encode()
+        return "Basic " + _b64.b64encode(creds).decode()
+
+    def enriquecer(
+        self,
+        dominio: str,
+        ips_conocidas: set,
+        findings: list,
+    ) -> None:
+        """
+        Consulta Censys por el dominio y añade hallazgos a la lista recibida.
+
+        Parámetros
+        ----------
+        dominio       : str        — Dominio objetivo
+        ips_conocidas : set[str]   — IPs ya descubiertas por el escaneo
+        findings      : list       — Lista de Finding a la que se añaden hallazgos
+        """
+        import urllib.request as _ureq
+        import urllib.error   as _uerr
+        import json           as _json
+        import time           as _time
+
+        auth = self._auth_header()
+        idx_base = max(
+            (int(f.id.split("-")[-1]) for f in findings if "-" in f.id),
+            default=0,
+        )
+
+        cursor: str | None = None
+        pagina = 0
+        hosts_censys: list[dict] = []
+
+        while pagina < self._MAX_PAGINAS:
+            # Construir URL con paginación
+            params = f"q=parsed.names%3A{_ureq.quote(dominio)}&per_page=100"
+            if cursor:
+                params += f"&cursor={_ureq.quote(cursor)}"
+            url = f"{_CENSYS_SEARCH_URL}?{params}"
+
+            try:
+                req = _ureq.Request(
+                    url,
+                    headers={
+                        "Authorization": auth,
+                        "User-Agent":    f"vamp-easm/{VERSION}",
+                        "Accept":        "application/json",
+                    },
+                )
+                with _ureq.urlopen(req, timeout=20) as resp:
+                    if resp.status != 200:
+                        break
+                    data = _json.loads(resp.read())
+            except _uerr.HTTPError as e:
+                if e.code in (401, 403):
+                    findings.append(Finding(
+                        id          = f"EASM-CNS-{idx_base + 1:03d}",
+                        title       = "Credenciales Censys inválidas o sin permisos",
+                        severity    = "INFO",
+                        description = (
+                            f"La API Censys devolvió {e.code}. "
+                            "Verificar --censys-id y --censys-secret."
+                        ),
+                        evidence    = f"URL: {_CENSYS_SEARCH_URL}",
+                        affected    = dominio,
+                        remediation = "Comprobar credenciales en https://search.censys.io/account",
+                        tags        = ["censys", "easm"],
+                    ))
+                break
+            except Exception:
+                break
+
+            lote = data.get("result", {}).get("hits", [])
+            hosts_censys.extend(lote)
+            cursor = data.get("result", {}).get("links", {}).get("next")
+            pagina += 1
+
+            if not cursor or not lote:
+                break
+
+            # Respetar el límite de 1 req/seg de la API gratuita
+            _time.sleep(1.0)
+
+        # Procesar cada host devuelto por Censys
+        for host in hosts_censys:
+            ip      = host.get("ip", "")
+            nombres = host.get("names", []) or []
+            servicios = host.get("services", []) or []
+            puertos = [s.get("port") for s in servicios if s.get("port")]
+
+            # Si la IP no fue encontrada por crt.sh/HackerTarget → hallazgo
+            if ip and ip not in ips_conocidas:
+                idx_base += 1
+                nombres_str = ", ".join(nombres[:5]) or "—"
+                puertos_str = ", ".join(str(p) for p in puertos[:10]) or "—"
+                findings.append(Finding(
+                    id          = f"EASM-CNS-{idx_base:03d}",
+                    title       = f"Host expuesto detectado por Censys (no en escaneo activo) — {ip}",
+                    severity    = "HIGH",
+                    description = (
+                        f"Censys indexa el host {ip} asociado al dominio '{dominio}' "
+                        "pero no fue descubierto por crt.sh ni HackerTarget. Puede "
+                        "tratarse de infraestructura shadow, activos olvidados o "
+                        "exposición no intencionada."
+                    ),
+                    evidence    = (
+                        f"IP: {ip}\n"
+                        f"Nombres DNS (Censys): {nombres_str}\n"
+                        f"Puertos indexados: {puertos_str}\n"
+                        f"Dominio consultado: {dominio}\n"
+                        "Fuente: Censys API v2 (datos históricos — verificar estado actual)"
+                    ),
+                    affected    = ip,
+                    remediation = (
+                        "Verificar si el activo pertenece a la organización. "
+                        "Si es legítimo, incluirlo en el inventario de superficie de ataque. "
+                        "Si no, investigar posible shadow IT o activo olvidado."
+                    ),
+                    tags        = ["censys", "easm", "CENSYS_HOST_EXPOSED"],
+                ))
+
+            # Puertos sensibles abiertos según Censys (para IPs conocidas y nuevas)
+            sensibles = [p for p in puertos if p in _CENSYS_PUERTOS_SENSIBLES]
+            for puerto in sensibles:
+                # Evitar duplicados con hallazgos Shodan
+                ya_reportado = any(
+                    f"{ip}:{puerto}" in (getattr(f, "affected", "") or "")
+                    for f in findings
+                )
+                if ya_reportado:
+                    continue
+                idx_base += 1
+                findings.append(Finding(
+                    id          = f"EASM-CNS-{idx_base:03d}",
+                    title       = f"Puerto sensible {puerto} abierto según Censys — {ip}",
+                    severity    = "MEDIUM",
+                    description = (
+                        f"Censys ha indexado el puerto {puerto} como abierto en "
+                        f"la IP {ip}. Este puerto corresponde a un servicio de "
+                        "alto riesgo si está expuesto sin control de acceso."
+                    ),
+                    evidence    = (
+                        f"IP: {ip}  Puerto: {puerto}\n"
+                        f"Servicios Censys: {', '.join(s.get('service_name','?') for s in servicios if s.get('port') == puerto) or '—'}\n"
+                        "Fuente: Censys API v2"
+                    ),
+                    affected    = f"{ip}:{puerto}",
+                    remediation = (
+                        f"Comprobar si el puerto {puerto} debe estar expuesto a internet. "
+                        "Si no es necesario, restringir acceso con firewall."
+                    ),
+                    tags        = ["censys", "easm", "port"],
+                ))
+
+
+# ---------------------------------------------------------------------------
 # Comando: scan
 # ---------------------------------------------------------------------------
 
@@ -477,6 +669,14 @@ def cmd_scan(args: argparse.Namespace) -> int:
             "[dim]  ℹ Shodan no activo — usa --shodan-key para enriquecer con datos Shodan[/dim]"
         )
 
+    # Leer claves Censys (opcional, v1.4)
+    censys_id     = getattr(args, "censys_id",     None) or __import__("os").environ.get("CENSYS_API_ID",     "")
+    censys_secret = getattr(args, "censys_secret", None) or __import__("os").environ.get("CENSYS_API_SECRET", "")
+    if not (censys_id and censys_secret):
+        console.print(
+            "[dim]  ℹ Censys no activo — usa --censys-id y --censys-secret para enriquecer con datos Censys[/dim]"
+        )
+
     # ── Motor de diffs ────────────────────────────────────────────────────
     console.print("\n[cyan]►[/cyan] [bold]Calculando diffs respecto al escaneo anterior…[/bold]")
     scan_anterior = storage.ultimo_scan(target)
@@ -521,6 +721,24 @@ def cmd_scan(args: argparse.Namespace) -> int:
         else:
             console.print("   [dim]Sin IPs resueltas para consultar Shodan.[/dim]")
 
+    # ── Enriquecimiento Censys (v1.4, opcional) ───────────────────────────
+    findings_censys: List[Finding] = []
+    if censys_id and censys_secret:
+        console.print("\n[cyan]►[/cyan] [bold]Enriquecimiento Censys (por dominio)…[/bold]")
+        # Recopilar IPs ya conocidas del escaneo activo
+        ips_conocidas: set = set()
+        for sub in resultado.subdominios:
+            if sub.ips:
+                ips_conocidas.update(sub.ips)
+
+        censys_enricher = CensysEASMEnricher(censys_id, censys_secret)
+        censys_enricher.enriquecer(target, ips_conocidas, findings_censys)
+        nuevos = len([f for f in findings_censys if "CENSYS_HOST_EXPOSED" in (getattr(f, "tags", None) or [])])
+        console.print(
+            f"   {nuevos} host(s) nuevos (CENSYS_HOST_EXPOSED) · "
+            f"{len(findings_censys)} hallazgos totales Censys"
+        )
+
     # ── Mostrar resultados ────────────────────────────────────────────────
     if diffs:
         console.print(_tabla_diffs(diffs))
@@ -538,6 +756,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     findings = [d.finding for d in diffs if d.finding is not None]
     # Incluir hallazgos Shodan en el informe si los hay
     findings.extend(findings_shodan)
+    # Incluir hallazgos Censys en el informe si los hay (v1.4)
+    findings.extend(findings_censys)
     if findings:
         meta = meta_from_args(args, tool=TOOL, version=VERSION)
         meta.scope = target
@@ -960,6 +1180,16 @@ def construir_parser() -> argparse.ArgumentParser:
         "--shodan-key", metavar="API_KEY", dest="shodan_key",
         help="Clave API Shodan (o var SHODAN_API_KEY) — enriquece IPs descubiertas "
              "con puertos, servicios y vulnerabilidades indexadas por Shodan",
+    )
+    p_scan.add_argument(
+        "--censys-id", metavar="ID", dest="censys_id",
+        help="ID de la API Censys v2 (o var CENSYS_API_ID) — enriquece el escaneo "
+             "con hosts detectados por Censys no visibles en crt.sh/HackerTarget (v1.4)",
+    )
+    p_scan.add_argument(
+        "--censys-secret", metavar="SECRET", dest="censys_secret",
+        help="Secret de la API Censys v2 (o var CENSYS_API_SECRET) — requerido junto "
+             "con --censys-id para activar el enriquecimiento Censys (v1.4)",
     )
     add_report_args(p_scan)
 
