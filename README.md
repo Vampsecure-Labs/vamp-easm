@@ -20,6 +20,9 @@ Part of the [VampSecure Labs](https://github.com/Vampsecure-Labs) security toolk
 - **Structured findings** — diffs are normalized as VSL findings (prefix `EASM-NNN`) compatible with `vamp-penreport`
 - **Webhook alerts** — POSTs a JSON payload (Slack/Discord/Mattermost compatible) when CRITICAL or HIGH diffs are found
 - **Exit codes** — machine-friendly: `0` clean, `1` HIGH diffs, `2` CRITICAL diffs (CI/CD and monitoring ready)
+- **Shodan enrichment** — queries Shodan by IP to surface sensitive ports, CVEs and alternative hostnames (`--shodan-key`)
+- **Censys enrichment** — discovers shadow hosts not found by crt.sh/HackerTarget using Censys API v2 (`--censys-id` / `--censys-secret`)
+- **Shodan Monitor integration** — creates persistent Monitor alerts that detect new open ports and CVEs automatically; `monitor` subcommand for full lifecycle management (v1.5)
 
 ---
 
@@ -140,11 +143,46 @@ fi
 
 ---
 
+### Shodan Monitor (v1.5)
+
+```bash
+# Step 1: run a scan first to populate IPs
+python vamp_easm.py scan --target example.com
+
+# Step 2: create a Shodan Monitor alert for those IPs
+python vamp_easm.py monitor --target example.com --shodan-key $SHODAN_KEY --setup
+
+# Step 3: check for new findings (new ports / CVEs since last check)
+python vamp_easm.py monitor --target example.com --shodan-key $SHODAN_KEY --check
+
+# Integrate Monitor check into every scan run
+python vamp_easm.py scan --target example.com --shodan-key $SHODAN_KEY --shodan-monitor
+
+# Manage alerts
+python vamp_easm.py monitor --shodan-key $SHODAN_KEY --list
+python vamp_easm.py monitor --target example.com --shodan-key $SHODAN_KEY --remove
+```
+
+State is persisted in `~/.config/vampsec/easm_shodan_monitor.json`. Each `--check` diffs against the previous run and emits `EASM-MON-NNN` findings.
+
+| Event | Severity |
+|---|---|
+| New sensitive port (21/23/3389/6379…) | HIGH |
+| New non-sensitive port | MEDIUM |
+| 3+ new CVEs on a single IP | CRITICAL |
+| 1–2 new CVEs | HIGH |
+| IP with no active matches | INFO |
+
+---
+
 ## Environment Variables
 
 | Variable | Description |
 |---|---|
 | `EASM_ALERT_WEBHOOK` | Webhook URL for alerts (alternative to `--alert-webhook`) |
+| `SHODAN_API_KEY` | Shodan API key (alternative to `--shodan-key`) |
+| `CENSYS_API_ID` | Censys API ID (alternative to `--censys-id`) |
+| `CENSYS_API_SECRET` | Censys API secret (alternative to `--censys-secret`) |
 
 ---
 
@@ -200,4 +238,4 @@ For authorized penetration testing use only.
 ---
 
 ## Versión
-v1.3 — VampSecure Labs Security Research Division
+v1.5 — VampSecure Labs Security Research Division
