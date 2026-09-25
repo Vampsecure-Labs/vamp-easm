@@ -36,9 +36,14 @@ DIFFS DETECTADOS
 USO
 ---
   python vamp_easm.py scan    --target ejemplo.com [--ports top100|22,80,443]
+  python vamp_easm.py scan    --target ejemplo.com --shodan-key KEY --shodan-monitor
   python vamp_easm.py history --target ejemplo.com [--limit 10]
   python vamp_easm.py assets  --target ejemplo.com
   python vamp_easm.py export  --target ejemplo.com [--json] [--html]
+  python vamp_easm.py monitor --target ejemplo.com --shodan-key KEY --setup
+  python vamp_easm.py monitor --target ejemplo.com --shodan-key KEY --check
+  python vamp_easm.py monitor --target ejemplo.com --shodan-key KEY --remove
+  python vamp_easm.py monitor --shodan-key KEY --list
 
 EXIT CODES
 ----------
@@ -59,6 +64,7 @@ import json
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional
 
 from rich.console import Console
@@ -76,7 +82,7 @@ from vampsec_report import (
 # Constantes
 # ---------------------------------------------------------------------------
 
-VERSION = "1.4"
+VERSION = "1.5"
 TOOL    = "vamp-easm"
 BRAND   = "VampSecure Labs — EASM Continuo"
 
@@ -87,7 +93,7 @@ BANNER = (
     " \\ V / _ \\| |\\/| |  _/\\__ \\ _| (__| |_| |   / _|| |__ / _ \\| _ \\__ \\\n"
     "  \\_/_/ \\_\\_|  |_|_|  |___/___\\___|\\___/|_|_\\___|____/_/ \\_\\___/___/\n"
     '  by Antonio Hernandez "Belky" — VampSecure Studios\n'
-    "  vamp-easm v1.4 · External Attack Surface Management\n"
+    "  vamp-easm v1.5 · External Attack Surface Management\n"
     "  ────────────────────────────────────────────────────────────────────────\n"
     "  USO EXCLUSIVO EN AUDITORÍAS AUTORIZADAS · El uso no autorizado es ilegal\n"
 )
@@ -370,6 +376,335 @@ class ShodanEASMEnricher:
                     remediation = "Verificar que el hostname corresponde a infraestructura autorizada.",
                     tags        = ["shodan", "easm", "hostname"],
                 ))
+
+
+# ---------------------------------------------------------------------------
+# Integración Shodan Monitor (v1.5)
+# ---------------------------------------------------------------------------
+
+class ShodanMonitorManager:
+    """
+    Gestión de alertas Shodan Monitor para monitorización automática de IPs.
+
+    Shodan Monitor crea alertas que se activan cuando Shodan detecta nuevos
+    puertos abiertos, vulnerabilidades o cambios en las IPs monitorizadas.
+
+    Endpoints:
+      GET    /shodan/alert/info?key=        → lista todas las alertas activas
+      POST   /shodan/alert?key=             → crea una alerta nueva
+      GET    /shodan/alert/{id}/info?key=   → estado y matches de una alerta
+      DELETE /shodan/alert/{id}?key=        → elimina una alerta
+    """
+
+    _BASE   = "https://api.shodan.io/shodan/alert"
+    _ESTADO = Path.home() / ".config" / "vampsec" / "easm_shodan_monitor.json"
+
+    def __init__(self, api_key: str) -> None:
+        self._key = api_key
+
+    def _peticion(self, metodo: str, url: str, body: Optional[dict] = None) -> dict:
+        """Realiza una petición HTTP a la API de Shodan Monitor."""
+        import urllib.request as _ureq
+        import urllib.error   as _uerr
+        import json           as _json
+
+        data_bytes = None
+        if body is not None:
+            data_bytes = _json.dumps(body).encode()
+
+        req = _ureq.Request(
+            url,
+            data=data_bytes,
+            method=metodo,
+            headers={
+                "User-Agent":   f"vamp-easm/{VERSION}",
+                "Accept":       "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with _ureq.urlopen(req, timeout=20) as resp:
+                contenido = resp.read()
+                if not contenido:
+                    return {}
+                return _json.loads(contenido)
+        except _uerr.HTTPError as e:
+            return {"__error__": e.code, "__msg__": e.reason}
+        except Exception as e:
+            return {"__error__": -1, "__msg__": str(e)}
+
+    def listar_alertas(self) -> list:
+        """Devuelve la lista de todas las alertas Shodan Monitor activas."""
+        resultado = self._peticion("GET", f"{self._BASE}/info?key={self._key}")
+        if "__error__" in resultado:
+            return []
+        if isinstance(resultado, list):
+            return resultado
+        return resultado.get("alerts", [])
+
+    def crear_alerta(self, nombre: str, ips: List[str]) -> Optional[dict]:
+        """
+        Crea una alerta Shodan Monitor para la lista de IPs.
+
+        Parámetros
+        ----------
+        nombre : str       — Nombre identificativo de la alerta
+        ips    : list[str] — Lista de IPs o rangos CIDR a monitorizar
+
+        Devuelve el dict de la alerta creada, o None si hay error.
+        """
+        ips_filtradas = [ip.strip() for ip in ips if ip.strip()]
+        if not ips_filtradas:
+            return None
+
+        body = {
+            "name":    nombre,
+            "filters": {"ip": " ".join(ips_filtradas)},
+        }
+        resultado = self._peticion("POST", f"{self._BASE}?key={self._key}", body=body)
+        if "__error__" in resultado:
+            return None
+        return resultado
+
+    def obtener_alerta(self, alert_id: str) -> Optional[dict]:
+        """Obtiene el estado actual y los matches de una alerta por ID."""
+        resultado = self._peticion("GET", f"{self._BASE}/{alert_id}/info?key={self._key}")
+        if "__error__" in resultado:
+            return None
+        return resultado
+
+    def eliminar_alerta(self, alert_id: str) -> bool:
+        """Elimina una alerta Shodan Monitor. Devuelve True si tuvo éxito."""
+        resultado = self._peticion("DELETE", f"{self._BASE}/{alert_id}?key={self._key}")
+        return resultado.get("success", False) or "__error__" not in resultado
+
+    def _cargar_estado(self) -> dict:
+        """Carga el estado persistido en ~/.config/vampsec/easm_shodan_monitor.json."""
+        import json as _j
+        if self._ESTADO.exists():
+            try:
+                return _j.loads(self._ESTADO.read_text())
+            except Exception:
+                return {}
+        return {}
+
+    def _guardar_estado(self, estado: dict) -> None:
+        """Persiste el estado en ~/.config/vampsec/easm_shodan_monitor.json."""
+        import json as _j
+        self._ESTADO.parent.mkdir(parents=True, exist_ok=True)
+        self._ESTADO.write_text(_j.dumps(estado, indent=2, ensure_ascii=False))
+
+    def setup_para_target(self, target: str, ips: List[str]) -> Optional[str]:
+        """
+        Crea (o reutiliza) una alerta Shodan Monitor para el target.
+
+        Devuelve el ID de la alerta, o None si no se pudo crear.
+        """
+        estado = self._cargar_estado()
+
+        # Reutilizar alerta existente si sigue activa en Shodan
+        if target in estado:
+            alert_id = estado[target].get("alert_id")
+            if alert_id and self.obtener_alerta(alert_id):
+                console.print(
+                    f"   [dim]Alerta Shodan Monitor ya existente: "
+                    f"ID [bold]{alert_id}[/bold][/dim]"
+                )
+                return alert_id
+
+        nombre  = f"vamp-easm:{target}"
+        alerta  = self.crear_alerta(nombre, ips)
+        if not alerta:
+            return None
+
+        alert_id = alerta.get("id") or alerta.get("alert_id")
+        if not alert_id:
+            return None
+
+        estado[target] = {
+            "alert_id":     alert_id,
+            "alert_name":   nombre,
+            "ips":          ips,
+            "created_at":   datetime.now(timezone.utc).isoformat(),
+            "last_checked": None,
+            "last_matches": {},
+        }
+        self._guardar_estado(estado)
+        return alert_id
+
+    def check_matches(self, target: str, findings: List) -> None:
+        """
+        Consulta la alerta activa del target y genera findings por cambios.
+
+        Compara los matches actuales con el estado previo persistido en disco
+        y emite hallazgos para nuevos puertos o CVEs detectados desde la
+        última comprobación. Modifica findings in-place.
+        """
+        estado = self._cargar_estado()
+        if target not in estado:
+            findings.append(Finding(
+                id          = "EASM-MON-001",
+                title       = "Shodan Monitor no configurado para este target",
+                severity    = "INFO",
+                description = (
+                    "No hay ninguna alerta Shodan Monitor activa para este target. "
+                    "Ejecuta 'vamp-easm monitor --target ... --setup' para crearla."
+                ),
+                evidence    = f"Target: {target}\nEstado: sin alerta",
+                affected    = target,
+                remediation = (
+                    "Ejecutar: vamp-easm monitor --target <dominio> "
+                    "--shodan-key <KEY> --setup"
+                ),
+                tags        = ["shodan-monitor", "easm"],
+            ))
+            return
+
+        info_target = estado[target]
+        alert_id    = info_target.get("alert_id")
+        if not alert_id:
+            return
+
+        alerta = self.obtener_alerta(alert_id)
+        if alerta is None:
+            findings.append(Finding(
+                id          = "EASM-MON-002",
+                title       = f"Alerta Shodan Monitor {alert_id} no encontrada",
+                severity    = "HIGH",
+                description = (
+                    f"La alerta Shodan Monitor con ID '{alert_id}' no responde. "
+                    "Puede haber sido eliminada o expirado. Recrear con '--setup'."
+                ),
+                evidence    = f"Alert ID: {alert_id}\nTarget: {target}",
+                affected    = target,
+                remediation = (
+                    "Ejecutar: vamp-easm monitor --target <dominio> "
+                    "--shodan-key <KEY> --setup"
+                ),
+                tags        = ["shodan-monitor", "easm"],
+            ))
+            return
+
+        # Construir mapa {ip: {ports, vulns}} de los matches actuales
+        matches_actuales: dict = {}
+        for match in alerta.get("matches", []) or []:
+            ip = match.get("ip_str", "")
+            if not ip:
+                continue
+            puertos = match.get("port", [])
+            if isinstance(puertos, int):
+                puertos = [puertos]
+            cves = list((match.get("vulns", {}) or {}).keys())
+            if ip not in matches_actuales:
+                matches_actuales[ip] = {"ports": [], "vulns": []}
+            for p in puertos:
+                if p not in matches_actuales[ip]["ports"]:
+                    matches_actuales[ip]["ports"].append(p)
+            for c in cves:
+                if c not in matches_actuales[ip]["vulns"]:
+                    matches_actuales[ip]["vulns"].append(c)
+
+        # Índice base para IDs de hallazgos
+        matches_previos = info_target.get("last_matches", {}) or {}
+        idx_base = 10
+
+        for ip, datos in matches_actuales.items():
+            puertos_previos = set(matches_previos.get(ip, {}).get("ports", []))
+            vulns_previas   = set(matches_previos.get(ip, {}).get("vulns", []))
+
+            # Nuevos puertos detectados
+            for puerto in datos["ports"]:
+                if puerto in puertos_previos:
+                    continue
+                idx_base += 1
+                sev = "HIGH" if puerto in _SHODAN_PUERTOS_SENSIBLES else "MEDIUM"
+                findings.append(Finding(
+                    id          = f"EASM-MON-{idx_base:03d}",
+                    title       = f"Shodan Monitor: nuevo puerto {puerto} en {ip}",
+                    severity    = sev,
+                    description = (
+                        f"Shodan Monitor alertó de la apertura del puerto {puerto} "
+                        f"en {ip}. No estaba presente en la última comprobación."
+                    ),
+                    evidence    = (
+                        f"IP: {ip}\n"
+                        f"Puerto nuevo: {puerto}\n"
+                        f"Puertos previos: "
+                        f"{', '.join(str(p) for p in sorted(puertos_previos)) or '—'}\n"
+                        f"Fuente: Shodan Monitor (alerta {alert_id})"
+                    ),
+                    affected    = f"{ip}:{puerto}",
+                    remediation = (
+                        f"Verificar inmediatamente el puerto {puerto} en {ip}. "
+                        "Si no es un servicio autorizado, aplicar regla de firewall."
+                    ),
+                    tags        = ["shodan-monitor", "easm", "new-port"],
+                ))
+
+            # Nuevas CVEs detectadas
+            vulns_nuevas = [v for v in datos["vulns"] if v not in vulns_previas]
+            if vulns_nuevas:
+                cves_str = ", ".join(vulns_nuevas[:10])
+                idx_base += 1
+                sev = "CRITICAL" if len(vulns_nuevas) >= 3 else "HIGH"
+                findings.append(Finding(
+                    id          = f"EASM-MON-{idx_base:03d}",
+                    title       = (
+                        f"Shodan Monitor: {len(vulns_nuevas)} CVE(s) "
+                        f"nueva(s) en {ip}"
+                    ),
+                    severity    = sev,
+                    description = (
+                        f"Shodan Monitor reporta {len(vulns_nuevas)} nueva(s) "
+                        f"vulnerabilidad(es) en {ip}: {cves_str[:100]}."
+                    ),
+                    evidence    = (
+                        f"IP: {ip}\n"
+                        f"CVEs nuevas: {cves_str}\n"
+                        f"CVEs previas: "
+                        f"{', '.join(sorted(vulns_previas)[:10]) or '—'}\n"
+                        f"Fuente: Shodan Monitor (alerta {alert_id})"
+                    ),
+                    affected    = ip,
+                    remediation = (
+                        "Consultar NVD para detalles y aplicar parches. "
+                        "Referencia: https://nvd.nist.gov/"
+                    ),
+                    cve         = vulns_nuevas[0],
+                    tags        = ["shodan-monitor", "easm", "cve", "new-vuln"],
+                ))
+
+        # IPs que desaparecen de matches (puertos posiblemente cerrados)
+        for ip in matches_previos:
+            if ip not in matches_actuales and matches_previos[ip].get("ports"):
+                idx_base += 1
+                findings.append(Finding(
+                    id          = f"EASM-MON-{idx_base:03d}",
+                    title       = f"Shodan Monitor: {ip} sin matches activos",
+                    severity    = "INFO",
+                    description = (
+                        f"La IP {ip} ya no aparece en los matches de Shodan Monitor. "
+                        "Los puertos previamente detectados podrían haberse cerrado."
+                    ),
+                    evidence    = (
+                        f"IP: {ip}\n"
+                        f"Puertos previos: "
+                        f"{', '.join(str(p) for p in matches_previos[ip].get('ports', []))}\n"
+                        "Fuente: Shodan Monitor"
+                    ),
+                    affected    = ip,
+                    remediation = (
+                        "Verificar el estado actual del host. "
+                        "Si es intencional, actualizar el inventario."
+                    ),
+                    tags        = ["shodan-monitor", "easm", "port-closed"],
+                ))
+
+        # Persistir estado actualizado
+        info_target["last_checked"] = datetime.now(timezone.utc).isoformat()
+        info_target["last_matches"] = matches_actuales
+        estado[target] = info_target
+        self._guardar_estado(estado)
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +1074,22 @@ def cmd_scan(args: argparse.Namespace) -> int:
             f"{len(findings_censys)} hallazgos totales Censys"
         )
 
+    # ── Shodan Monitor: verificar alertas activas (v1.5) ─────────────────
+    findings_monitor: List[Finding] = []
+    if shodan_key_easm and getattr(args, "shodan_monitor", False):
+        console.print("\n[cyan]►[/cyan] [bold]Shodan Monitor: verificando alertas activas…[/bold]")
+        mon_mgr = ShodanMonitorManager(shodan_key_easm)
+        mon_mgr.check_matches(target, findings_monitor)
+        nuevos_mon = [
+            f for f in findings_monitor
+            if "new-port" in (getattr(f, "tags", None) or [])
+            or "new-vuln" in (getattr(f, "tags", None) or [])
+        ]
+        console.print(
+            f"   {len(nuevos_mon)} nueva(s) amenaza(s) Shodan Monitor · "
+            f"{len(findings_monitor)} hallazgos totales"
+        )
+
     # ── Mostrar resultados ────────────────────────────────────────────────
     if diffs:
         console.print(_tabla_diffs(diffs))
@@ -758,6 +1109,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     findings.extend(findings_shodan)
     # Incluir hallazgos Censys en el informe si los hay (v1.4)
     findings.extend(findings_censys)
+    # Incluir hallazgos Shodan Monitor en el informe si los hay (v1.5)
+    findings.extend(findings_monitor)
     if findings:
         meta = meta_from_args(args, tool=TOOL, version=VERSION)
         meta.scope = target
@@ -1119,6 +1472,170 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Comando: monitor
+# ---------------------------------------------------------------------------
+
+def cmd_monitor(args: argparse.Namespace) -> int:
+    """
+    Gestión de alertas Shodan Monitor para monitorización automática de IPs.
+
+    Acciones disponibles:
+      --setup  : crea una alerta Shodan Monitor para las IPs del target
+      --check  : consulta la alerta y muestra nuevas amenazas detectadas
+      --remove : elimina la alerta del target
+      --list   : lista todas las alertas Shodan Monitor de la cuenta
+    """
+    shodan_key = (
+        getattr(args, "shodan_key", None)
+        or __import__("os").environ.get("SHODAN_API_KEY", "")
+    )
+    if not shodan_key:
+        console.print("[red]Error:[/red] Se requiere --shodan-key o SHODAN_API_KEY")
+        return 1
+
+    mgr = ShodanMonitorManager(shodan_key)
+
+    # ── Listar todas las alertas ──────────────────────────────────────────
+    if getattr(args, "list_alerts", False):
+        alertas = mgr.listar_alertas()
+        if not alertas:
+            console.print("[dim]No hay alertas Shodan Monitor activas.[/dim]")
+            return 0
+        tabla = Table(title="Alertas Shodan Monitor", box=box.SIMPLE_HEAVY)
+        tabla.add_column("ID",     style="cyan",  no_wrap=True)
+        tabla.add_column("Nombre", style="white")
+        tabla.add_column("IPs",    style="dim",   max_width=40)
+        tabla.add_column("Creada", style="dim")
+        for a in alertas:
+            tabla.add_row(
+                str(a.get("id",      "—")),
+                str(a.get("name",    "—")),
+                str(a.get("filters", {}).get("ip", "—"))[:40],
+                str(a.get("created", "—"))[:16],
+            )
+        console.print(tabla)
+        return 0
+
+    # Las demás acciones requieren --target
+    target = getattr(args, "target", None)
+    if not target:
+        console.print(
+            "[red]Error:[/red] --target es obligatorio para "
+            "--setup, --check y --remove"
+        )
+        return 1
+
+    # ── Setup: crear alerta Shodan Monitor ───────────────────────────────
+    if getattr(args, "setup", False):
+        storage.inicializar_db()
+        assets  = storage.todos_los_assets(target)
+        ips_set: set = {a["ip"] for a in assets if a.get("ip")}
+
+        if not ips_set:
+            # Fallback: resolución DNS directa del dominio
+            import socket as _sock
+            try:
+                for item in _sock.getaddrinfo(target, None):
+                    ips_set.add(item[4][0])
+            except Exception:
+                pass
+
+        if not ips_set:
+            console.print(
+                f"[red]Error:[/red] Sin IPs para {target}. "
+                "Ejecuta primero: vamp-easm scan --target " + target
+            )
+            return 1
+
+        ips = list(ips_set)
+        ips_str = ", ".join(ips[:5]) + ("…" if len(ips) > 5 else "")
+        console.print(
+            f"[cyan]►[/cyan] Creando alerta Shodan Monitor para "
+            f"[bold]{target}[/bold] · {len(ips)} IP(s): [dim]{ips_str}[/dim]"
+        )
+
+        alert_id = mgr.setup_para_target(target, ips)
+        if not alert_id:
+            console.print(
+                "[red]Error:[/red] No se pudo crear la alerta en Shodan Monitor.\n"
+                "[dim]Verifica que la clave API tiene permisos de monitorización.[/dim]"
+            )
+            return 1
+
+        console.print(
+            f"[green]✓ Alerta creada:[/green] ID [bold]{alert_id}[/bold]\n"
+            f"  Usa '--check' para consultar los matches."
+        )
+        return 0
+
+    # ── Check: consultar matches y generar findings ───────────────────────
+    if getattr(args, "check", False):
+        console.print(
+            f"[cyan]►[/cyan] Consultando Shodan Monitor para [bold]{target}[/bold]…"
+        )
+        findings: List[Finding] = []
+        mgr.check_matches(target, findings)
+
+        if not findings:
+            console.print("[green]✓ Sin novedades en Shodan Monitor.[/green]")
+            return 0
+
+        tabla = Table(title=f"Shodan Monitor — {target}", box=box.SIMPLE_HEAVY)
+        tabla.add_column("ID",       style="dim",   no_wrap=True, max_width=16)
+        tabla.add_column("Sev",      no_wrap=True,  max_width=10)
+        tabla.add_column("Título",   style="white", max_width=60)
+        tabla.add_column("Afectado", style="cyan",  max_width=25)
+        for f in findings:
+            tabla.add_row(
+                f.id,
+                _badge_sev(f.severity),
+                f.title[:60],
+                f.affected or "—",
+            )
+        console.print(tabla)
+
+        criticos = [f for f in findings if f.severity == "CRITICAL"]
+        highs    = [f for f in findings if f.severity == "HIGH"]
+        console.print(
+            f"\n[bold]Resumen:[/bold] {len(findings)} hallazgos — "
+            f"{len(criticos)} CRITICAL · {len(highs)} HIGH"
+        )
+        if criticos:
+            return 2
+        if highs:
+            return 1
+        return 0
+
+    # ── Remove: eliminar alerta ───────────────────────────────────────────
+    if getattr(args, "remove", False):
+        estado = mgr._cargar_estado()
+        if target not in estado:
+            console.print(f"[yellow]⚠[/yellow] Sin alerta registrada para {target}")
+            return 0
+        alert_id = estado[target].get("alert_id")
+        if not alert_id:
+            console.print(f"[yellow]⚠[/yellow] Sin alert_id registrado para {target}")
+            return 0
+        console.print(
+            f"[cyan]►[/cyan] Eliminando alerta Shodan Monitor "
+            f"ID [bold]{alert_id}[/bold]…"
+        )
+        if mgr.eliminar_alerta(alert_id):
+            del estado[target]
+            mgr._guardar_estado(estado)
+            console.print(f"[green]✓ Alerta {alert_id} eliminada.[/green]")
+            return 0
+        console.print(f"[red]Error:[/red] No se pudo eliminar la alerta {alert_id}")
+        return 1
+
+    console.print(
+        "[yellow]⚠[/yellow] Especifica una acción: "
+        "--setup, --check, --remove o --list"
+    )
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # CLI — definición de argumentos
 # ---------------------------------------------------------------------------
 
@@ -1135,11 +1652,15 @@ def construir_parser() -> argparse.ArgumentParser:
             "Ejemplos:\n"
             "  python vamp_easm.py scan    --target ejemplo.com\n"
             "  python vamp_easm.py scan    --target ejemplo.com --ports 22,80,443 --html\n"
+            "  python vamp_easm.py scan    --target ejemplo.com --shodan-key KEY --shodan-monitor\n"
             "  python vamp_easm.py history --target ejemplo.com --limit 5\n"
             "  python vamp_easm.py assets  --target ejemplo.com\n"
             "  python vamp_easm.py export  --target ejemplo.com --json\n"
             "  python vamp_easm.py watch   --target ejemplo.com --interval 1800\n"
             "  python vamp_easm.py diff    --target ejemplo.com --from 2026-09-01 --to 2026-09-17\n"
+            "  python vamp_easm.py monitor --target ejemplo.com --shodan-key KEY --setup\n"
+            "  python vamp_easm.py monitor --target ejemplo.com --shodan-key KEY --check\n"
+            "  python vamp_easm.py monitor --shodan-key KEY --list\n"
         ),
     )
     parser.add_argument(
@@ -1190,6 +1711,12 @@ def construir_parser() -> argparse.ArgumentParser:
         "--censys-secret", metavar="SECRET", dest="censys_secret",
         help="Secret de la API Censys v2 (o var CENSYS_API_SECRET) — requerido junto "
              "con --censys-id para activar el enriquecimiento Censys (v1.4)",
+    )
+    p_scan.add_argument(
+        "--shodan-monitor", action="store_true", dest="shodan_monitor",
+        help="Integrar con Shodan Monitor: verificar alertas activas durante el escaneo. "
+             "Requiere --shodan-key y haber ejecutado previamente "
+             "'vamp-easm monitor --setup' (v1.5)",
     )
     add_report_args(p_scan)
 
@@ -1259,6 +1786,36 @@ def construir_parser() -> argparse.ArgumentParser:
         help="Fecha de fin del rango (YYYY-MM-DD o YYYY-MM-DDTHH:MM)",
     )
 
+    # ── monitor ───────────────────────────────────────────────────────────
+    p_mon = subparsers.add_parser(
+        "monitor",
+        help="Gestión de alertas Shodan Monitor para monitorización automática de IPs",
+    )
+    p_mon.add_argument(
+        "--target", metavar="DOMINIO",
+        help="Dominio objetivo (requerido para --setup, --check, --remove)",
+    )
+    p_mon.add_argument(
+        "--shodan-key", metavar="API_KEY", dest="shodan_key",
+        help="Clave API Shodan (o var SHODAN_API_KEY)",
+    )
+    p_mon.add_argument(
+        "--setup", action="store_true",
+        help="Crear alerta Shodan Monitor para las IPs del target",
+    )
+    p_mon.add_argument(
+        "--check", action="store_true",
+        help="Consultar matches actuales y mostrar nuevas amenazas detectadas",
+    )
+    p_mon.add_argument(
+        "--remove", action="store_true",
+        help="Eliminar la alerta Shodan Monitor del target",
+    )
+    p_mon.add_argument(
+        "--list", action="store_true", dest="list_alerts",
+        help="Listar todas las alertas Shodan Monitor activas en la cuenta",
+    )
+
     return parser
 
 
@@ -1282,6 +1839,7 @@ def main() -> None:
         "export":  cmd_export,
         "watch":   cmd_watch,
         "diff":    cmd_diff,
+        "monitor": cmd_monitor,
     }
 
     handler = _dispatch.get(args.comando)
