@@ -297,7 +297,9 @@ class ShodanEASMEnricher:
                 continue
 
             puertos:   list = data.get("ports", []) or []
-            vulns_raw: dict = data.get("vulns", {}) or {}
+            _vr = data.get("vulns", {}) or {}
+            # La API puede devolver lista o dict según versión del endpoint
+            vulns_raw: dict = {v: {} for v in _vr} if isinstance(_vr, list) else _vr
             hostnames: list = data.get("hostnames", []) or []
             org:       str  = data.get("org", "") or ""
             sistema:   str  = data.get("os", "") or ""
@@ -459,7 +461,7 @@ class ShodanMonitorManager:
 
         body = {
             "name":    nombre,
-            "filters": {"ip": " ".join(ips_filtradas)},
+            "filters": {"ip": ips_filtradas},
         }
         resultado = self._peticion("POST", f"{self._BASE}?key={self._key}", body=body)
         if "__error__" in resultado:
@@ -1529,7 +1531,7 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     if getattr(args, "setup", False):
         storage.inicializar_db()
         assets  = storage.todos_los_assets(target)
-        ips_set: set = {a["ip"] for a in assets if a.get("ip")}
+        ips_set: set = {a["ip"] for a in assets if a["ip"]} if assets else set()
 
         if not ips_set:
             # Fallback: resolución DNS directa del dominio
@@ -1547,7 +1549,16 @@ def cmd_monitor(args: argparse.Namespace) -> int:
             )
             return 1
 
-        ips = list(ips_set)
+        import ipaddress as _ipa
+        def _es_publica(ip: str) -> bool:
+            try:
+                return not _ipa.ip_address(ip).is_private
+            except ValueError:
+                return False
+        ips = [ip for ip in ips_set if _es_publica(ip)]
+        if not ips:
+            console.print("[red]Error:[/red] No se encontraron IPs públicas para el target.")
+            return 1
         ips_str = ", ".join(ips[:5]) + ("…" if len(ips) > 5 else "")
         console.print(
             f"[cyan]►[/cyan] Creando alerta Shodan Monitor para "
