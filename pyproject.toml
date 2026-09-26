@@ -7,7 +7,7 @@ name = "vamp-easm"
 version = "1.5"
 description = "External Attack Surface Management (EASM) scanner for authorized audits"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "AGPL-3.0-only" }
 requires-python = ">=3.9"
 authors = [{ name = "VampSecure Studios", email = "contact@vampsecurestudios.com" }]
 keywords = ["security", "pentest", "audit", "cybersecurity", "vampsecure", "easm", "attack-surface", "external", "reconnaissance"]
@@ -15,7 +15,7 @@ classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Information Technology",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Topic :: Security",

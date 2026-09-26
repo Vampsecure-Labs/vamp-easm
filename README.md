@@ -230,7 +230,7 @@ The `EASM-NNN` finding IDs are stable within a single scan run and can be refere
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+AGPL-3.0 License — see [LICENSE](LICENSE) for details.
 
 © VampSecure Studios — VampSecure Labs Security Research Division  
 For authorized penetration testing use only.
