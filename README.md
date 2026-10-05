@@ -239,5 +239,10 @@ For authorized penetration testing use only.
 
 ---
 
-## Versión
-v1.5 — VampSecure Labs Security Research Division
+## Historial de versiones
+
+| Versión | Cambios principales |
+|---------|---------------------|
+| v1.6 | Enriquecimiento GreyNoise free API (`/v3/context/{ip}`) — activo por defecto, sin clave; `--no-greynoise` para desactivar; hallazgos HIGH para IPs maliciosas conocidas |
+| v1.5 | Shodan Monitor integration — alertas persistentes con `monitor` subcommand |
+| v1.4 | Enriquecimiento Censys v2 (`--censys-id` / `--censys-secret`) |

@@ -82,7 +82,7 @@ from vampsec_report import (
 # Constantes
 # ---------------------------------------------------------------------------
 
-VERSION = "1.5"
+VERSION = "1.6"
 TOOL    = "vamp-easm"
 BRAND   = "VampSecure Labs — EASM Continuo"
 
@@ -902,6 +902,142 @@ class CensysEASMEnricher:
 
 
 # ---------------------------------------------------------------------------
+# Enriquecimiento GreyNoise (API free — no requiere clave)
+# ---------------------------------------------------------------------------
+
+class GreyNoiseEASMEnricher:
+    """
+    Enriquecimiento EASM con la API gratuita de GreyNoise.
+
+    Consulta GET /v3/context/{ip} (sin autenticación) para cada IP descubierta
+    y genera hallazgos cuando la IP aparece como scanner malicioso conocido
+    o como ruido de internet (benign scanner).
+
+    Documentación: https://viz.greynoise.io/docs/api
+    Límite: 10 IPs por invocación; sin clave = tier free (rate-limit ~ 100/día).
+    """
+
+    _BASE    = "https://api.greynoise.io/v3/context/{ip}"
+    _MAX_IPS = 10
+
+    def enriquecer(
+        self,
+        ips: List[str],
+        findings: List,
+        idx_base: int = 0,
+    ) -> None:
+        """
+        Enriquece findings con información GreyNoise para cada IP.
+
+        Modifica findings in-place. Hallazgos generados:
+          - IP maliciosa conocida (malicious == True)    → HIGH
+          - IP de scanner benigno (classification=benign) → INFO
+          - IP desconocida (noise == False)              → silencioso
+        """
+        import urllib.request as _ureq
+        import json as _json
+
+        # Solo IPs válidas sin repetición
+        vistas: set = set()
+        ips_validas: List[str] = []
+        for ip in ips:
+            ip = ip.strip()
+            partes = ip.split(".")
+            if len(partes) == 4 and all(p.isdigit() for p in partes) and ip not in vistas:
+                ips_validas.append(ip)
+                vistas.add(ip)
+
+        ips_validas = ips_validas[: self._MAX_IPS]
+
+        for i, ip in enumerate(ips_validas, start=1):
+            url = self._BASE.format(ip=ip)
+            try:
+                req = _ureq.Request(
+                    url,
+                    headers={
+                        "User-Agent": f"vamp-easm/{VERSION}",
+                        "Accept":     "application/json",
+                    },
+                )
+                with _ureq.urlopen(req, timeout=10) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = _json.loads(resp.read())
+            except Exception:
+                continue
+
+            noise      = data.get("noise", False)
+            riot       = data.get("riot", False)       # known benign service
+            malicious  = data.get("malicious", False)
+            classif    = data.get("classification", "")
+            actor      = data.get("actor", "")
+            tags_gn    = data.get("tags", []) or []
+
+            if not noise and not malicious:
+                # IP desconocida — sin hallazgo
+                continue
+
+            if riot:
+                # Red conocida benigna (Cloudflare, Google, etc.) — solo INFO
+                findings.append(Finding(
+                    id          = f"EASM-GN-{idx_base + i:03d}",
+                    title       = f"IP en GreyNoise RIOT (servicio benigno conocido): {ip}",
+                    severity    = "INFO",
+                    description = (
+                        f"La IP {ip} está catalogada en GreyNoise RIOT como "
+                        f"perteneciente a un servicio benigno conocido "
+                        f"(CDN, motor de búsqueda, monitorización). "
+                        f"Clasificación: {classif}. Actor: {actor or 'N/A'}."
+                    ),
+                    evidence    = f"greynoise.io/viz/ip/{ip}",
+                    affected    = ip,
+                    remediation = "Verificar que esta IP en tu superficie es esperada para el servicio.",
+                    tags        = ["greynoise", "riot", "easm"],
+                ))
+                continue
+
+            if malicious or classif == "malicious":
+                sev = "HIGH"
+                titulo = f"IP maliciosa en GreyNoise: {ip}"
+                descripcion = (
+                    f"La IP {ip} está catalogada en GreyNoise como maliciosa. "
+                    f"Actor: {actor or 'desconocido'}. "
+                    f"Etiquetas: {', '.join(tags_gn) or 'N/A'}. "
+                    f"Esta IP aparece en tu superficie de ataque — si pertenece a "
+                    f"tu infraestructura, investiga posible compromiso."
+                )
+                remediation = (
+                    "Verificar el propietario de la IP. Si es propia, revisar "
+                    "si el servidor está comprometido o mal configurado. "
+                    "Si es de terceros, evaluar si debe estar expuesta."
+                )
+            else:
+                sev = "INFO"
+                titulo = f"IP escáner/ruido GreyNoise ({classif}): {ip}"
+                descripcion = (
+                    f"La IP {ip} aparece en GreyNoise como ruido de internet "
+                    f"(escáner masivo o crawler). Clasificación: {classif}. "
+                    f"Actor: {actor or 'N/A'}. Etiquetas: {', '.join(tags_gn) or 'N/A'}."
+                )
+                remediation = (
+                    "Verificar si esta IP debe estar expuesta. "
+                    "Si no es propia, contextualiza si es una IP de tercero "
+                    "relacionada con el target (CDN, proxy, etc.)."
+                )
+
+            findings.append(Finding(
+                id          = f"EASM-GN-{idx_base + i:03d}",
+                title       = titulo,
+                severity    = sev,
+                description = descripcion,
+                evidence    = f"greynoise.io/viz/ip/{ip}",
+                affected    = ip,
+                remediation = remediation,
+                tags        = ["greynoise", "easm"] + [t.lower() for t in tags_gn[:5]],
+            ))
+
+
+# ---------------------------------------------------------------------------
 # Comando: scan
 # ---------------------------------------------------------------------------
 
@@ -1076,6 +1212,29 @@ def cmd_scan(args: argparse.Namespace) -> int:
             f"{len(findings_censys)} hallazgos totales Censys"
         )
 
+    # ── Enriquecimiento GreyNoise free API (v1.6) ────────────────────────
+    findings_greynoise: List[Finding] = []
+    if not getattr(args, "no_greynoise", False):
+        console.print("\n[cyan]►[/cyan] [bold]Enriquecimiento GreyNoise (API free)…[/bold]")
+        ips_gn: List[str] = []
+        for sub in resultado.subdominios:
+            if sub.ips:
+                ips_gn.extend(sub.ips)
+        if ips_gn:
+            idx_gn = max(
+                (int(f.id.split("-")[-1]) for f in findings_shodan if "-" in f.id),
+                default=0,
+            )
+            gn_enricher = GreyNoiseEASMEnricher()
+            gn_enricher.enriquecer(ips_gn, findings_greynoise, idx_base=idx_gn)
+            gn_high = [f for f in findings_greynoise if f.severity == "HIGH"]
+            console.print(
+                f"   {len(gn_high)} IP(s) maliciosas · "
+                f"{len(findings_greynoise)} hallazgos totales GreyNoise"
+            )
+        else:
+            console.print("   [dim]Sin IPs resueltas para consultar GreyNoise.[/dim]")
+
     # ── Shodan Monitor: verificar alertas activas (v1.5) ─────────────────
     findings_monitor: List[Finding] = []
     if shodan_key_easm and getattr(args, "shodan_monitor", False):
@@ -1113,6 +1272,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     findings.extend(findings_censys)
     # Incluir hallazgos Shodan Monitor en el informe si los hay (v1.5)
     findings.extend(findings_monitor)
+    # Incluir hallazgos GreyNoise en el informe si los hay (v1.6)
+    findings.extend(findings_greynoise)
     if findings:
         meta = meta_from_args(args, tool=TOOL, version=VERSION)
         meta.scope = target
@@ -1728,6 +1889,12 @@ def construir_parser() -> argparse.ArgumentParser:
         help="Integrar con Shodan Monitor: verificar alertas activas durante el escaneo. "
              "Requiere --shodan-key y haber ejecutado previamente "
              "'vamp-easm monitor --setup' (v1.5)",
+    )
+    p_scan.add_argument(
+        "--no-greynoise", action="store_true", dest="no_greynoise",
+        help="Desactivar el enriquecimiento GreyNoise (activo por defecto, sin clave "
+             "API — usa la API free /v3/context/<ip>; desactivar si no hay internet "
+             "o el destino es una red aislada) (v1.6)",
     )
     add_report_args(p_scan)
 
