@@ -1,4 +1,6 @@
 <!-- © VampSecure Studios — VampSecure Labs Security Research Division -->
+
+  <img src="https://github.com/Vampsecure-Labs/vamp-easm/actions/workflows/ci.yml/badge.svg" alt="CI"/>
 # vamp-easm
 
 **Continuous External Attack Surface Management with daily diff tracking**
