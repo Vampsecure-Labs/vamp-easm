@@ -60,7 +60,6 @@ AUTORÍA
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 from datetime import datetime, timezone
@@ -74,7 +73,7 @@ from rich import box
 
 from easm import scanner, storage, differ, alerter
 from vampsec_report import (
-    Finding, ReportMeta, VampSecReport,
+    Finding, VampSecReport,
     add_report_args, meta_from_args,
 )
 
@@ -1152,7 +1151,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     # ── Motor de diffs ────────────────────────────────────────────────────
     console.print("\n[cyan]►[/cyan] [bold]Calculando diffs respecto al escaneo anterior…[/bold]")
-    scan_anterior = storage.ultimo_scan(target)
+    storage.ultimo_scan(target)
     # El último scan completado puede ser el actual si ya acabó (no debería),
     # así que buscamos el penúltimo para comparar
     historial = storage.historial_scans(target, limit=5)
@@ -1352,7 +1351,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 
     scan_id = rows[0]["id"]
     assets  = storage.assets_del_scan(args.target, scan_id)
-    certs   = storage.certs_del_scan(args.target, scan_id)
+    storage.certs_del_scan(args.target, scan_id)
 
     # Construir findings de info a partir de los activos
     findings: List[Finding] = []

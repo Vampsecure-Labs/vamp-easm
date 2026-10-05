@@ -21,7 +21,6 @@ Realiza el descubrimiento de la superficie de ataque externa en tres fases:
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import shutil
 import socket
@@ -31,7 +30,7 @@ import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 
 # ---------------------------------------------------------------------------

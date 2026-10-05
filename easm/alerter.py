@@ -150,7 +150,7 @@ def enviar_webhook(
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return 200 <= resp.status < 300
-    except urllib.error.HTTPError as exc:
+    except urllib.error.HTTPError:
         return False
     except Exception:
         return False

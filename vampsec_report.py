@@ -613,7 +613,7 @@ class VampSecReport:
                 f'  <div class="fld-val">{f.remediation}</div>'
                 f'</div>'
                 + (f'<div class="card-refs"><strong>Referencias:</strong> {refs_h}</div>' if refs_h else "")
-                + f'</div>'
+                + '</div>'
             )
         return "\n".join(partes)
 
