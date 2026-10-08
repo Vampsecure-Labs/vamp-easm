@@ -239,6 +239,79 @@ For authorized penetration testing use only.
 
 ---
 
+## Sample Output
+
+```
+$ python vamp_easm.py scan --target example.com --html
+
+ vamp-easm v1.6 — VampSecure Labs
+ Target: example.com  |  Previous scan: 2026-10-01 06:14 UTC  |  Δ diff mode ON
+
+ [Phase 1] Subdomain enumeration
+  crt.sh       →  14 results
+  HackerTarget →  11 results
+  Union        →  16 unique subdomains
+
+ [Phase 2] TCP scan  (top-100 ports, async)
+  Scanning 16 hosts ... done in 4.2 s
+
+ [Phase 3] TLS inspection
+  16 certificates analysed
+
+ [Phase 4] GreyNoise enrichment
+  IPs queried: 9  |  Malicious: 1 (192.168.45.12 — see EASM-005)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ DIFFS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  EASM-001  HIGH      NUEVO_SUBDOMINIO  dev-internal.example.com → 192.168.20.14
+  EASM-002  MEDIUM    NUEVO_PUERTO      api.example.com:8080 opened (was closed)
+  EASM-003  HIGH      CERT_EXPIRADO     mail.example.com — expires in 11 days
+  EASM-004  CRITICAL  CERT_CAMBIADO     www.example.com — fingerprint changed
+                                        prev: sha256:3b2e...  now: sha256:f9a1...
+  EASM-005  HIGH      IP_GREYNOISE      192.168.45.12 classified malicious by GreyNoise
+  EASM-006  MEDIUM    IP_CAMBIADA       cdn.example.com  10.0.2.5 → 10.0.18.91
+  EASM-007  LOW       SERVICIO_DESAP.   ftp.example.com:21 no longer reachable
+
+ Summary: 1 CRITICAL · 3 HIGH · 2 MEDIUM · 1 LOW
+ HTML report: easm_example.com_20261008.html
+ Exit code: 2
+```
+
+## Why vamp-easm vs. Netlas · Censys · Shodan Monitor nativo
+
+| Capability | vamp-easm | Netlas | Censys | Shodan Monitor |
+|---|---|---|---|---|
+| Self-hosted — no data sent to third parties | ✅ | ❌ cloud | ❌ cloud | ❌ cloud |
+| Delta diff against your own historical baseline | ✅ SQLite | ❌ | ❌ | ⚠️ alert only |
+| crt.sh + HackerTarget enumeration (free) | ✅ | ❌ API credit | ⚠️ paid tier | ❌ |
+| GreyNoise reputation enrichment (free tier) | ✅ | ❌ | ❌ | ❌ |
+| Shodan Monitor integration (persistent alerts) | ✅ | ❌ | ❌ | ✅ |
+| VSL findings format (EASM-NNN) for penreport | ✅ | ❌ | ❌ | ❌ |
+| CI/CD machine-readable exit codes | ✅ | ❌ | ❌ | ❌ |
+| Webhook alerts (Slack/Discord/Mattermost) | ✅ | ⚠️ email only | ⚠️ email only | ⚠️ email only |
+
+- **Zero external data residency**: all scan results stay in a local SQLite file — no domain, IP, or certificate data leaves your perimeter.
+- **Continuous delta tracking**: knowing that `dev-internal.example.com` appeared *this week* is more actionable than a full asset inventory; the diff engine surfaces only what changed since the last run.
+- **Multi-source corroboration**: crt.sh catches newly issued certificates; HackerTarget catches DNS records; Censys catches shadow infrastructure not yet in CT logs — combining all three reduces blind spots.
+- **GreyNoise reputation at zero cost**: the free-tier `/v3/context/{ip}` call flags IPs already associated with malicious activity without requiring a paid API key.
+
+## Check Coverage
+
+| Check ID | Description | Standard | Severity |
+|---|---|---|---|
+| EASM-001 | New subdomain not seen in previous scan | CIS Control 1 (Asset Inventory) | HIGH |
+| EASM-002 | New TCP port open since last scan | NIST CSF Identify (ID.AM-1) | MEDIUM |
+| EASM-003 | TLS certificate expiring within 30 days | CIS Control 9.4 | HIGH |
+| EASM-004 | TLS certificate already expired | CIS Control 9.4 | CRITICAL |
+| EASM-005 | TLS certificate fingerprint changed — possible re-issue or MitM | NIST CSF PR.DS-2 | CRITICAL |
+| EASM-006 | DNS resolution for known subdomain returned different IP | NIST CSF ID.AM-1 | MEDIUM |
+| EASM-007 | Previously open port is no longer reachable | NIST CSF ID.AM-1 | LOW |
+| EASM-008 | IP flagged as malicious by GreyNoise free API | NIST CSF DE.CM-1 | HIGH |
+| EASM-009 | TLS certificate is self-signed (no trusted CA chain) | CIS Control 9.4 | HIGH |
+| EASM-010 | Sensitive port newly opened (21/23/3389/5900/6379) | CIS Control 4 | HIGH |
+| EASM-MON-001 | Shodan Monitor — 1–2 new CVEs detected on monitored IP | NIST CSF ID.RA-1 | HIGH |
+| EASM-MON-002 | Shodan Monitor — 3 or more new CVEs on single IP | NIST CSF ID.RA-1 | CRITICAL |
+
 ## Historial de versiones
 
 | Versión | Cambios principales |
