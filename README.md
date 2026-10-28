@@ -246,7 +246,7 @@ For authorized penetration testing use only.
 ```
 $ python vamp_easm.py scan --target example.com --html
 
- vamp-easm v1.7 — VampSecure Labs
+ vamp-easm v1.6 — VampSecure Labs
  Target: example.com  |  Previous scan: 2026-10-01 06:14 UTC  |  Δ diff mode ON
 
  [Phase 1] Subdomain enumeration
@@ -560,7 +560,7 @@ Uso exclusivo en pruebas de penetración autorizadas.
 ```
 $ python vamp_easm.py scan --target example.com --html
 
- vamp-easm v1.7 — VampSecure Labs
+ vamp-easm v1.6 — VampSecure Labs
  Objetivo: example.com  |  Escaneo anterior: 2026-10-01 06:14 UTC  |  Δ modo diff ACTIVO
 
  [Fase 1] Enumeración de subdominios
